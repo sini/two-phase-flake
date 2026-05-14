@@ -1,0 +1,28 @@
+{
+  "home-manager": {
+    "flake": true,
+    "locked": {
+      "type": "github",
+      "owner": "nix-community",
+      "repo": "home-manager",
+      "rev": "9760b31dab3016fc6e422ca241cfeac605fb89c9",
+      "narHash": "sha256-ihH1UnI6nYSOkjAg4QsOadg6sp2LxXnWO9urPbo3/hw="
+    },
+    "follows": {
+      "nixpkgs": "nixpkgs"
+    }
+  },
+  "flake-parts": {
+    "flake": true,
+    "locked": {
+      "type": "github",
+      "owner": "hercules-ci",
+      "repo": "flake-parts",
+      "rev": "f7c1a2d347e4c52d5fb8d10cb4d94b5884e546fb",
+      "narHash": "sha256-m1Yf0wZ8j1OHjTc2UwHwyQRSnNeSgLJOd7q5Y45hzi4="
+    },
+    "follows": {
+      "nixpkgs-lib": "nixpkgs"
+    }
+  }
+}

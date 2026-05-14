@@ -2,34 +2,53 @@
 {
   description = "Two-phase flake: synthetic thin eval collects inputs, bootstrap materializes a real flake";
   outputs =
-    inputs:
+    flakeInputs:
     let
-      lib = inputs.nixpkgs.lib;
-      importTree = import inputs.import-tree;
+      lib = flakeInputs.nixpkgs.lib;
+      importTree = import flakeInputs.import-tree;
 
-      eval = lib.evalModules {
-        specialArgs = {
-          inherit inputs;
-          inherit (inputs) self;
-        };
+      # Thin eval: collect input declarations (only forces pure data)
+      thinEval = lib.evalModules {
         modules = [
-          inputs.flake-file.flakeModules.flake
+          flakeInputs.flake-file.flakeModules.flake
           (importTree ./modules)
         ];
       };
 
-      # Use flake-outputs (raw attrset) not flake-file's outputs (submodule-wrapped)
-      moduleOutputs = eval.config.flake-outputs;
+      declared = thinEval.config.flake-file.inputs;
 
-      # Bootstrap: re-materialize flake.nix from module declarations
-      flakeFileLib = import "${inputs.flake-file}/dev/modules/_lib" lib;
+      # Resolve inputs: real flake inputs win, fetchTree fallback from lock
+      allInputs = import ./resolve.nix {
+        inherit lib flakeInputs;
+        lockFile = ./inputs.lock;
+        declaredInputs = declared;
+      };
+
+      # Full eval with all resolved inputs
+      fullEval = lib.evalModules {
+        specialArgs = {
+          inputs = allInputs;
+          inherit (allInputs) self;
+        };
+        modules = [
+          flakeInputs.flake-file.flakeModules.flake
+          (importTree ./modules)
+        ];
+      };
+
+      moduleOutputs = fullEval.config.flake-outputs;
+
+      # Bootstrap: materialize flake.nix with real inputs for the external interface
+      flakeFileLib = import "${flakeInputs.flake-file}/dev/modules/_lib" lib;
       inherit (flakeFileLib) inputsExpr nixCode;
 
-      resolvedInputs = eval.config.flake-file.preProcess (inputsExpr eval.config.flake-file.inputs);
+      resolvedInputs = thinEval.config.flake-file.preProcess (
+        inputsExpr thinEval.config.flake-file.inputs
+      );
 
       flakeSource =
         let
-          desc = lib.escape [ "\"" "\\" ] (eval.config.flake-file.description or "");
+          desc = lib.escape [ "\"" "\\" ] (thinEval.config.flake-file.description or "");
           inputsBody = nixCode {
             expr = resolvedInputs;
             styles = [
@@ -57,7 +76,7 @@
       bootstrapApp =
         system:
         let
-          pkgs = inputs.nixpkgs.legacyPackages.${system};
+          pkgs = flakeInputs.nixpkgs.legacyPackages.${system};
           flakeFile = pkgs.writeText "flake-source.nix" flakeSource;
         in
         {
@@ -74,12 +93,67 @@
             }
           );
         };
+
+      # Lock manager: writes inputs.lock from current flake.lock / resolved state
+      lockApp =
+        system:
+        let
+          pkgs = flakeInputs.nixpkgs.legacyPackages.${system};
+
+          # Build lock entries for inputs not in seed
+          seedNames = [
+            "nixpkgs"
+            "import-tree"
+            "flake-file"
+          ];
+          extraDeclared = lib.filterAttrs (n: _: !lib.elem n seedNames) declared;
+
+          lockEntries = lib.mapAttrs (
+            name: _spec:
+            let
+              src = allInputs.${name} or null;
+            in
+            if src == null then
+              null
+            else
+              {
+                flake = _spec.flake or true;
+                locked = {
+                  type = "github";
+                  owner = _spec.owner or "";
+                  repo = _spec.repo or "";
+                  rev = src.rev or "";
+                  narHash = src.narHash or "";
+                };
+                follows = lib.mapAttrs (_: sub: sub.follows or null) (
+                  lib.filterAttrs (_: sub: sub.follows or null != null) (_spec.inputs or { })
+                );
+              }
+          ) extraDeclared;
+
+          lockJson = builtins.toJSON (lib.filterAttrs (_: v: v != null) lockEntries);
+          lockFile = pkgs.writeText "inputs-lock.json" lockJson;
+        in
+        {
+          type = "app";
+          program = lib.getExe (
+            pkgs.writeShellApplication {
+              name = "update-lock";
+              runtimeInputs = [ pkgs.jq ];
+              text = ''
+                jq . ${lockFile} > inputs.lock
+                echo "inputs.lock updated."
+              '';
+            }
+          );
+        };
     in
     moduleOutputs
     // {
       apps = lib.recursiveUpdate (moduleOutputs.apps or { }) (
         eachSystem (system: {
           bootstrap = bootstrapApp system;
+          update-lock = lockApp system;
         })
       );
     };

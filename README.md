@@ -1,66 +1,51 @@
 # two-phase-flake
 
-A self-bootstrapping Nix flake that collects input declarations from a module tree and materializes them into a real `flake.nix` with proper flake evaluation and locking.
+Module-driven flake input resolution with a real, overridable flake interface.
 
 ## Why not npins / nixlock / with-inputs?
 
-Tools like [npins](https://github.com/andir/npins), [nixlock](https://github.com/vic/flake-file), and with-inputs solve the "inputs as data" problem by **bypassing the flake input system entirely** — they fetch sources at eval time via `builtins.fetchTree` or `builtins.fetchGit` from a side-channel lock file. This means:
+These tools bypass the flake input system — they fetch sources at eval time via `builtins.fetchTree` from a side-channel lock file. This means you lose `nix flake lock`, `follows`, `--override-input`, `nix flake metadata`, and downstream input deduplication.
 
-- You lose `nix flake lock` and its update/override/follows machinery
-- Inputs aren't visible to `nix flake metadata` or the flake registry
-- Downstream consumers can't `follows` your inputs
-- Nix's input deduplication and caching don't apply
+## Why not just flake-file's write-flake?
 
-[flake-file](https://github.com/vic/flake-file) takes a different approach — it generates a real `flake.nix` from module declarations using `write-flake`. But it requires running a generation step as a separate tool invocation, and the generated flake doesn't carry the generation logic with it.
+flake-file generates a real `flake.nix` from module declarations. But evaluation is blocked until you run the generation step — you can't `nix eval` until `flake.nix` has the right inputs. The generation step is a prerequisite, not an optimization.
 
-## What this project does differently
+## What this does differently
 
-Two-phase-flake materializes a **real flake** — inputs go through Nix's native flake evaluation, get proper `flake.lock` pinning, and participate in the flake ecosystem (`follows`, `--override-input`, `nix flake update`, `nix flake metadata`). The difference is **how** the flake gets there:
+Two-phase-flake combines both approaches:
 
-1. **Phase 1 (synthetic thin eval):** A seed flake with only `nixpkgs`, `import-tree`, and `flake-file` runs `lib.evalModules` on the module tree. This forces only `flake-file.inputs` — pure data declarations — while output definitions that reference unavailable inputs remain as unevaluated thunks. flake-file's `inputsExpr` + `nixCode` render the resolved inputs into valid Nix source.
-
-2. **Bootstrap:** `nix run .#bootstrap` writes the materialized `flake.nix` containing all declared inputs and the outputs expression. This is a one-time step (or whenever inputs change).
-
-3. **Phase 2 (real flake eval):** The materialized `flake.nix` is a normal flake. `nix flake lock` pins inputs. `nix build`, `nix develop`, `--override-input`, `follows` — everything works as expected. The module tree provides outputs through `evalModules`.
-
-The key property: **the module tree is the source of truth for both input declarations and outputs**, but the end result is a real flake with native input resolution — not an eval-time bypass.
+- **fetchTree fallback** — evaluation always works, even from a seed flake with only nixpkgs + import-tree + flake-file. Missing inputs are resolved via `builtins.fetchTree` from `inputs.lock` (pure, uses narHash).
+- **Real flake interface** — `nix run .#bootstrap` materializes a `flake.nix` with all inputs declared as real flake inputs. After this, `follows`, `--override-input`, and `nix flake metadata` all work.
+- **Resolver prefers real inputs** — when a real flake input exists, it's used instead of fetchTree. Downstream overrides win automatically.
 
 ```
-seed-flake.nix (3 inputs)        modules/inputs.nix
-  │ thin eval via evalModules       │ flake-file.inputs declarations
-  │ forces only input declarations  │ (home-manager, flake-parts, ...)
-  └──────────────┬──────────────────┘
-                 │ flake-file inputsExpr + nixCode
-                 ▼
-           nix run .#bootstrap
-                 │ writes materialized flake.nix
-                 ▼
-           flake.nix (real flake)
-                 │ nix flake lock, nix build, etc.
-                 ▼
-           normal flake ecosystem
+                    resolve.nix
+                   ┌──────────────────────────────┐
+                   │ for each declared input:      │
+flakeInputs ──────▶  present? → use it (real)     │──▶ allInputs
+                   │  absent?  → fetchTree (lock)  │
+inputs.lock ──────▶                                │
+                   └──────────────────────────────┘
 ```
 
-## Getting started
+## Lifecycle
 
 ```bash
-# Start from the seed flake
+# 1. Start from seed — everything works immediately via fetchTree
 cp seed-flake.nix flake.nix
+nix eval .#packages.x86_64-linux.hello.name  # works
 
-# Phase 1: bootstrap materializes flake.nix with all declared inputs
+# 2. Bootstrap — promote to real flake inputs for the external interface
 nix run .#bootstrap
-
-# Lock the real inputs
 nix flake lock
 
-# Phase 2: everything works normally
-nix eval .#packages.x86_64-linux.hello.name
-# => "hello-2.12.3"
+# 3. Now downstream consumers can follows/override your inputs
+# inputs.two-phase.inputs.home-manager.follows = "home-manager";
 ```
 
-## Adding inputs
+## Adding an input
 
-Declare inputs anywhere in your module tree:
+1. Declare it in any module:
 
 ```nix
 # modules/my-feature.nix
@@ -73,32 +58,44 @@ Declare inputs anywhere in your module tree:
 }
 ```
 
-Then re-materialize:
+2. Lock it for fetchTree fallback, then bootstrap for real flake inputs:
 
 ```bash
-nix run .#bootstrap
-nix flake lock
+nix run .#update-lock   # writes inputs.lock
+nix run .#bootstrap     # materializes flake.nix
+nix flake lock          # pins real inputs
 ```
 
 ## Project structure
 
 ```
-├── flake.nix          # Materialized — generated by bootstrap
-├── seed-flake.nix     # Seed — copy to flake.nix to start fresh
-├── outputs-expr.nix   # Outputs expression (embedded in generated flake.nix)
+├── flake.nix          # Materialized (generated) or seed
+├── seed-flake.nix     # Minimal seed — copy to flake.nix to start fresh
+├── outputs-expr.nix   # Shared outputs logic (used by both seed and generated)
+├── resolve.nix        # Input resolver: real flake input or fetchTree fallback
+├── inputs.lock        # Locked narHash/rev for fetchTree resolution
 └── modules/
     ├── inputs.nix     # Input declarations via flake-file.inputs
-    └── outputs.nix    # Real flake outputs (phase 2)
+    └── outputs.nix    # Flake outputs
 ```
+
+## How the resolver works
+
+`resolve.nix` takes the set of real flake inputs and the lock file, then for each declared input:
+
+1. **Real flake input available?** Use it. This means `--override-input` and `follows` from downstream consumers take effect.
+2. **Lock entry available?** `builtins.fetchTree` with the locked narHash (pure), then `import "${tree}/flake.nix"` and call `.outputs` with follows wired to seed inputs.
+3. **Neither?** Input is unavailable (outputs referencing it will fail lazily).
+
+This means the seed flake evaluates immediately (fetchTree mode), and after bootstrap the same code path uses real flake inputs instead — no behavior change, just better integration with the flake ecosystem.
 
 ## Design properties
 
-- **Real flake evaluation** — inputs go through `nix flake lock`, visible in metadata, support `follows` and `--override-input`
-- **Module tree is source of truth** — input declarations and outputs live in `modules/`
-- **Lazy phase separation** — thin eval never forces outputs that reference missing inputs
-- **flake-file resolution** — typed input options with url, follows, sub-inputs; rendered by flake-file's `inputsExpr` / `nixCode`
-- **Self-contained bootstrap** — the seed flake carries the generation logic; no external tool needed
-- **Idempotent** — re-running bootstrap with unchanged modules produces the same flake.nix
+- **Always evaluable** — seed flake works via fetchTree, no bootstrap prerequisite
+- **Real flake interface** — after bootstrap, inputs are real flake inputs with full ecosystem support
+- **Override wins** — resolver prefers flake inputs over lock, so `--override-input` and `follows` work
+- **Module tree is source of truth** — flake-file.inputs declarations drive both fetchTree and bootstrap
+- **Pure** — fetchTree with narHash is deterministic, no `--impure` needed
 
 ## Requirements
 
