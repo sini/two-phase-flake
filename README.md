@@ -1,33 +1,59 @@
 # two-phase-flake
 
-A self-bootstrapping Nix flake that collects input declarations from a module tree and materializes them into `flake.nix` — no external tooling required.
+A self-bootstrapping Nix flake that collects input declarations from a module tree and materializes them into a real `flake.nix` with proper flake evaluation and locking.
 
-## The problem
+## Why not npins / nixlock / with-inputs?
 
-Nix flakes require all inputs to be declared statically in `flake.nix`. In modular projects, the set of required inputs is determined by which modules are active — but you can't evaluate modules without first having the inputs they need.
+Tools like [npins](https://github.com/andir/npins), [nixlock](https://github.com/vic/flake-file), and with-inputs solve the "inputs as data" problem by **bypassing the flake input system entirely** — they fetch sources at eval time via `builtins.fetchTree` or `builtins.fetchGit` from a side-channel lock file. This means:
 
-## The solution
+- You lose `nix flake lock` and its update/override/follows machinery
+- Inputs aren't visible to `nix flake metadata` or the flake registry
+- Downstream consumers can't `follows` your inputs
+- Nix's input deduplication and caching don't apply
 
-Two-phase evaluation:
+[flake-file](https://github.com/vic/flake-file) takes a different approach — it generates a real `flake.nix` from module declarations using `write-flake`. But it requires running a generation step as a separate tool invocation, and the generated flake doesn't carry the generation logic with it.
 
-1. **Phase 1 (thin eval):** A seed flake with only `nixpkgs` + `import-tree` evaluates the module tree, forcing only pure data declarations (`collect.inputs`). This determines what inputs are needed without requiring them to exist yet.
+## What this project does differently
 
-2. **Phase 2 (full eval):** After bootstrap regenerates `flake.nix` with all declared inputs and `nix flake lock` pins them, the same module tree provides real outputs through `evalModules`.
+Two-phase-flake materializes a **real flake** — inputs go through Nix's native flake evaluation, get proper `flake.lock` pinning, and participate in the flake ecosystem (`follows`, `--override-input`, `nix flake update`, `nix flake metadata`). The difference is **how** the flake gets there:
+
+1. **Phase 1 (synthetic thin eval):** A seed flake with only `nixpkgs`, `import-tree`, and `flake-file` runs `lib.evalModules` on the module tree. This forces only `flake-file.inputs` — pure data declarations — while output definitions that reference unavailable inputs remain as unevaluated thunks. flake-file's `inputsExpr` + `nixCode` render the resolved inputs into valid Nix source.
+
+2. **Bootstrap:** `nix run .#bootstrap` writes the materialized `flake.nix` containing all declared inputs and the outputs expression. This is a one-time step (or whenever inputs change).
+
+3. **Phase 2 (real flake eval):** The materialized `flake.nix` is a normal flake. `nix flake lock` pins inputs. `nix build`, `nix develop`, `--override-input`, `follows` — everything works as expected. The module tree provides outputs through `evalModules`.
+
+The key property: **the module tree is the source of truth for both input declarations and outputs**, but the end result is a real flake with native input resolution — not an eval-time bypass.
+
+```
+seed-flake.nix (3 inputs)        modules/inputs.nix
+  │ thin eval via evalModules       │ flake-file.inputs declarations
+  │ forces only input declarations  │ (home-manager, flake-parts, ...)
+  └──────────────┬──────────────────┘
+                 │ flake-file inputsExpr + nixCode
+                 ▼
+           nix run .#bootstrap
+                 │ writes materialized flake.nix
+                 ▼
+           flake.nix (real flake)
+                 │ nix flake lock, nix build, etc.
+                 ▼
+           normal flake ecosystem
+```
 
 ## Getting started
 
 ```bash
-# Clone and enter
-git clone https://github.com/sini/two-phase-flake
-cd two-phase-flake
+# Start from the seed flake
+cp seed-flake.nix flake.nix
 
-# Phase 1: bootstrap generates flake.nix with all declared inputs
+# Phase 1: bootstrap materializes flake.nix with all declared inputs
 nix run .#bootstrap
 
-# Lock the new inputs
+# Lock the real inputs
 nix flake lock
 
-# Phase 2: full eval works
+# Phase 2: everything works normally
 nix eval .#packages.x86_64-linux.hello.name
 # => "hello-2.12.3"
 ```
@@ -40,74 +66,44 @@ Declare inputs anywhere in your module tree:
 # modules/my-feature.nix
 { lib, ... }:
 {
-  collect.inputs.some-flake = {
-    url = "github:owner/repo";
+  flake-file.inputs.disko = {
+    url = "github:nix-community/disko";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 }
 ```
 
-Then re-bootstrap:
+Then re-materialize:
 
 ```bash
 nix run .#bootstrap
-nix flake lock --update-input some-flake
+nix flake lock
 ```
 
 ## Project structure
 
 ```
-├── flake.nix                # Generated — don't edit by hand
-├── _bootstrap/
-│   ├── options.nix          # Module options schema (collect.inputs, outputs)
-│   ├── collect.nix          # Thin eval: extracts input declarations
-│   └── render.nix           # Nix source code generator
+├── flake.nix          # Materialized — generated by bootstrap
+├── seed-flake.nix     # Seed — copy to flake.nix to start fresh
+├── outputs-expr.nix   # Outputs expression (embedded in generated flake.nix)
 └── modules/
-    ├── inputs.nix           # Input declarations (phase 1)
-    ├── outputs.nix          # Real outputs (phase 2)
-    └── bootstrap.nix        # Keeps bootstrap app available after phase 2
-```
-
-## How it works internally
-
-### Thin eval (`_bootstrap/collect.nix`)
-
-Runs `lib.evalModules` on the module tree with only the `collect` options defined. Since Nix is lazy, output definitions that reference unavailable inputs are never forced — only `config.collect.inputs` (pure data) is evaluated.
-
-### Rendering (`_bootstrap/render.nix`)
-
-Takes the collected input specs and serializes them into valid Nix source with proper escaping, dotted-key notation for simple inputs, and `follows` declarations.
-
-### The seed flake
-
-The initial `flake.nix` (before first bootstrap) detects which declared inputs are missing from the actual flake inputs. If any are missing, it exposes only the bootstrap app. If all are satisfied, it does the full `evalModules` and exposes real outputs.
-
-### Output merging
-
-Modules contribute to `config.outputs` as a list of attrsets, merged with `lib.recursiveUpdate`. This allows multiple modules to provide outputs without conflicts:
-
-```nix
-# modules/my-outputs.nix
-{ inputs, lib, ... }:
-{
-  outputs = [{
-    packages.x86_64-linux.my-thing = ...;
-  }];
-}
+    ├── inputs.nix     # Input declarations via flake-file.inputs
+    └── outputs.nix    # Real flake outputs (phase 2)
 ```
 
 ## Design properties
 
-- **Zero external dependencies** — bootstrap logic is self-contained in `_bootstrap/`
-- **Module tree is source of truth** — both input declarations and outputs live in `modules/`
-- **Lazy phase separation** — thin eval never forces outputs that need unavailable inputs
-- **Idempotent** — re-running bootstrap with unchanged modules produces the same file
-- **Incremental** — add inputs in any module, re-bootstrap, lock, done
+- **Real flake evaluation** — inputs go through `nix flake lock`, visible in metadata, support `follows` and `--override-input`
+- **Module tree is source of truth** — input declarations and outputs live in `modules/`
+- **Lazy phase separation** — thin eval never forces outputs that reference missing inputs
+- **flake-file resolution** — typed input options with url, follows, sub-inputs; rendered by flake-file's `inputsExpr` / `nixCode`
+- **Self-contained bootstrap** — the seed flake carries the generation logic; no external tool needed
+- **Idempotent** — re-running bootstrap with unchanged modules produces the same flake.nix
 
 ## Requirements
 
 - Nix with flakes enabled
-- Only `nixpkgs` and [`import-tree`](https://github.com/vic/import-tree) as seed inputs
+- Seed inputs: [`nixpkgs`](https://github.com/NixOS/nixpkgs), [`import-tree`](https://github.com/vic/import-tree), [`flake-file`](https://github.com/vic/flake-file)
 
 ## License
 
